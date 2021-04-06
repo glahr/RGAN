@@ -13,12 +13,14 @@ import paths
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import multivariate_normal, invgamma, mode
 from scipy.special import gamma
-from scipy.misc import imresize
+# from scipy.misc import imresize
 from functools import partial
 from math import ceil
 
 from sklearn.metrics.pairwise import rbf_kernel
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
 
 # --- to do with loading --- #
 def get_samples_and_labels(settings):
@@ -43,6 +45,16 @@ def get_samples_and_labels(settings):
         assert train_labels.shape[1] == settings['cond_dim']
         # normalise to between -1, 1
         train, vali, test = normalise_data(train, vali, test)
+    elif settings['data'] == 'threading':
+        samples, pdf, labels = get_data('threading', {})
+
+        max_seq_len = 0
+        for data_i in samples:
+            max_seq_len = max(max_seq_len, len(data_i[:, 0]))
+        samples = tf.keras.preprocessing.sequence.pad_sequences(samples, maxlen=max_seq_len, padding='post',
+                                                                 dtype='float32')
+        train, test, train_labels, test_labels = train_test_split(samples, labels, test_size = 0.33, random_state = 42)
+        vali, test, vali_labels, test_labels = train_test_split(test, test_labels, test_size = 0.5, random_state = 42)
     else:
         # generate the data
         data_vars = ['num_samples', 'seq_length', 'num_signals', 'freq_low',
@@ -66,7 +78,10 @@ def get_samples_and_labels(settings):
             train_labels, vali_labels, test_labels = labels_list
 
     labels = dict()
-    labels['train'], labels['vali'], labels['test'] = train_labels, vali_labels, test_labels
+    if settings['data'] == 'threading':
+        labels['train'], labels['vali'], labels['test'] = train_labels.values, vali_labels.values, test_labels.values
+    else:
+        labels['train'], labels['vali'], labels['test'] = train_labels, vali_labels, test_labels
 
     samples = dict()
     samples['train'], samples['vali'], samples['test'] = train, vali, test
@@ -135,6 +150,54 @@ def get_data(data_type, data_options=None):
         samples, labels = eICU_task()
     elif data_type == 'resampled_eICU':
         samples, labels = resampled_eICU(**data_options)
+    elif data_type == 'threading':
+        features = ['fx', 'fy', 'fz', 'mx', 'my', 'mz']
+        pos = ['x', 'y', 'z', 'rotx', 'roty', 'rotz']
+        vel = ['vx', 'vy', 'vz', 'vrotx', 'vroty']  # , 'vrotz'] # nao vou usar por enquanto
+        dt = 0.012
+        n_batches = 2
+
+        def remove_offset(data):
+            for feature in features:
+                # feature = 'fy'
+                n = 50
+                mean = np.mean(data[feature][:n])
+                data[feature] = data[feature] - mean
+            return data
+
+        def generate_velocity(data):
+            for feature in data[pos]:
+                data['v' + feature] = data[feature].diff() / dt
+                data['v' + feature][0] = 0.0
+            return data
+
+        def get_data_with_velocity():
+            forces = ['fx', 'fy', 'fz', 'mx', 'my', 'mz']
+            vel = ['vx', 'vy', 'vz', 'vrotx', 'vroty']
+            all_data = []
+            for batch in range(n_batches):
+                for bolt in range(40):
+                    file = '~/kuka-ml-threading/dataset/dataset_new_iros21/new_dataset_with_linear_error/data_insertion/data_insertion_batch_' + \
+                           str(batch).zfill(4) + '_bolt_' + str(bolt).zfill(2)
+
+                    data = pd.read_csv(file + '.csv')
+                    data = remove_offset(data)
+                    # plt.plot(data[features])
+                    # plt.legend(features)
+
+                    # plt.title('Batch #' + str(batch) + ', Bolt #' + str(bolt))
+                    # plt.show()
+                    data = generate_velocity(data)
+                    data.drop(columns=['Unnamed: 13'], inplace=True)
+                    all_data.append(data[forces + vel].values)
+            return all_data
+
+        samples = get_data_with_velocity()
+        labels = pd.read_csv(
+            '~/kuka-ml-threading/dataset/dataset_new_iros21/new_dataset_with_linear_error/data_labels/labels.csv')
+        labels = labels.loc[:n_batches*40-1]
+        # labels = OneHotEncoder().fit_transform(labels.values).toarray()
+
     else:
         raise ValueError(data_type)
     print('Generated/loaded', len(samples), 'samples from data-type', data_type)
